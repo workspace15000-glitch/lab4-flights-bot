@@ -1,7 +1,10 @@
 import asyncio
+import getpass
+import logging
 import os
 import re
 import sqlite3
+import sys
 from collections import defaultdict
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
@@ -9,9 +12,12 @@ from html import escape
 from pathlib import Path
 from time import monotonic
 from typing import NamedTuple
+
 import httpx
 from telegram import LinkPreviewOptions, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import Conflict, InvalidToken, NetworkError
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 
 API_URL = "https://api.rasp.yandex-net.ru/v3.0/schedule/"
@@ -225,3 +231,43 @@ async def handle(update: Update, context):
                 await update.message.reply_text(f"Выберите аэропорт. Доступные коды: {AIRPORT_LIST}.", reply_markup=MENU)
     except sqlite3.Error:
         await update.message.reply_text("Не удалось прочитать или сохранить настройки. Попробуйте позже.")
+
+
+def read_secret(variable, prompt):
+    value = os.getenv(variable, "").strip()
+    if not value:
+        if not sys.stdin.isatty():
+            raise SystemExit(f"Задайте {variable} в настройках запуска или запустите программу в терминале.")
+        try:
+            value = getpass.getpass(f"{prompt}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            raise SystemExit("Запуск отменён.") from None
+    if not value:
+        raise SystemExit(f"Введите {prompt.lower()}.")
+    return value
+
+
+def main():
+    token = read_secret("BOT_TOKEN", "Токен BotFather")
+    os.environ["RASP_KEY"] = read_secret("RASP_KEY", "Ключ Яндекс Расписаний")
+    # Скрываем служебные сообщения, которые могут содержать ключи.
+    logging.getLogger("telegram").setLevel(logging.CRITICAL)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    private = filters.ChatType.PRIVATE
+    commands = ["start", "help", "departures", "arrivals", "airport", "limit", "flight", "settings"]
+    try:
+        app = Application.builder().token(token).build()
+        app.add_handler(CommandHandler(commands, handle, private))
+        app.add_handler(MessageHandler(private & filters.TEXT & ~filters.COMMAND, handle))
+        print("Запуск бота. Отправьте /start в Telegram.")
+        app.run_polling(allowed_updates=["message"])
+    except InvalidToken:
+        raise SystemExit("Telegram отклонил токен. Проверьте его в BotFather.") from None
+    except Conflict:
+        raise SystemExit("Эта копия бота уже запущена. Сначала остановите другой процесс.") from None
+    except NetworkError:
+        raise SystemExit("Нет подключения к Telegram. Проверьте интернет и повторите запуск.") from None
+
+
+if __name__ == "__main__":
+    main()
