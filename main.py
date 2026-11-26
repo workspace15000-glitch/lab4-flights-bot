@@ -10,21 +10,28 @@ from pathlib import Path
 from time import monotonic
 from typing import NamedTuple
 import httpx
-from telegram import LinkPreviewOptions
+from telegram import LinkPreviewOptions, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
 
 
 API_URL = "https://api.rasp.yandex-net.ru/v3.0/schedule/"
 DATABASE = Path(__file__).with_name("flight_settings.sqlite3")
 AIRPORTS = {"SVO": "Шереметьево", "VKO": "Внуково", "DME": "Домодедово"}
-
-
+AIRPORT_NAMES = {name.upper(): code for code, name in AIRPORTS.items()}
 DEFAULT_AIRPORT, DEFAULT_LIMIT, MAX_LIMIT = "SVO", 5, 10
 MOSCOW = timezone(timedelta(hours=3))
 CACHE_SECONDS = 180
 DEPARTURES, ARRIVALS, SETTINGS = "Вылеты", "Прилёты", "Настройки"
-
-
+MENU = ReplyKeyboardMarkup([[DEPARTURES, ARRIVALS], [SETTINGS]], resize_keyboard=True)
+AIRPORT_LIST = ", ".join(f"{code} ({name})" for code, name in AIRPORTS.items())
+HELP = (
+    f"Расписание московских аэропортов. Время московское.\n\nАэропорты: {AIRPORT_LIST}.\n"
+    "Введите код, название аэропорта или /airport VKO.\n"
+    "Вылеты — /departures, прилёты — /arrivals.\n"
+    "Поиск по номеру на сегодня — /flight SU100.\n"
+    f"Число рейсов в выдаче от 1 до {MAX_LIMIT} — /limit 3.\n"
+    "Настройки — /settings."
+)
 SOURCE = '<a href="https://rasp.yandex.ru/">Данные предоставлены сервисом Яндекс.Расписания</a>'
 
 
@@ -180,3 +187,41 @@ async def show_settings(update, **changes):
     airport, limit = preferences(update.effective_user.id, **changes)
     heading = "Настройки сохранены" if changes else SETTINGS
     await update.message.reply_text(f"{heading}\nАэропорт: {AIRPORTS[airport]} ({airport})\nРейсов в выдаче: {limit}")
+
+
+async def handle(update: Update, context):
+    text = update.message.text.strip()
+    if text.startswith("/"):
+        command = text.split(maxsplit=1)[0].split("@")[0].lower()
+        argument = " ".join(context.args or []).upper()
+    else:
+        command, argument = text, text.upper()
+    try:
+        if command in ("/start", "/help"):
+            await update.message.reply_text(f"{HELP}\n\n{SOURCE}", reply_markup=MENU, parse_mode=ParseMode.HTML,
+                                            link_preview_options=LinkPreviewOptions(is_disabled=True))
+        elif command in ("/departures", DEPARTURES):
+            await show_board(update, "departure")
+        elif command in ("/arrivals", ARRIVALS):
+            await show_board(update, "arrival")
+        elif command in ("/settings", SETTINGS):
+            await show_settings(update)
+        elif command == "/limit":
+            if not re.fullmatch(r"[0-9]{1,2}", argument) or not 1 <= int(argument) <= MAX_LIMIT:
+                await update.message.reply_text(f"Укажите число от 1 до {MAX_LIMIT}. Пример: /limit 3.")
+            else:
+                await show_settings(update, limit=int(argument))
+        elif command == "/flight":
+            number = normalize_number(argument)
+            if re.fullmatch(r"[A-ZА-ЯЁ0-9]{2,12}", number) and any(char.isdigit() for char in number):
+                await show_board(update, number=number)
+            else:
+                await update.message.reply_text("Введите номер рейса. Пример: /flight SU100.")
+        else:
+            airport = AIRPORT_NAMES.get(argument, argument)
+            if airport in AIRPORTS:
+                await show_settings(update, airport=airport)
+            else:
+                await update.message.reply_text(f"Выберите аэропорт. Доступные коды: {AIRPORT_LIST}.", reply_markup=MENU)
+    except sqlite3.Error:
+        await update.message.reply_text("Не удалось прочитать или сохранить настройки. Попробуйте позже.")
