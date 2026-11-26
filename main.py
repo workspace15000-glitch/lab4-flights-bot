@@ -1,13 +1,17 @@
 import asyncio
 import os
+import re
 import sqlite3
 from collections import defaultdict
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
+from html import escape
 from pathlib import Path
 from time import monotonic
 from typing import NamedTuple
 import httpx
+from telegram import LinkPreviewOptions
+from telegram.constants import ParseMode
 
 
 API_URL = "https://api.rasp.yandex-net.ru/v3.0/schedule/"
@@ -18,6 +22,10 @@ AIRPORTS = {"SVO": "Шереметьево", "VKO": "Внуково", "DME": "Д
 DEFAULT_AIRPORT, DEFAULT_LIMIT, MAX_LIMIT = "SVO", 5, 10
 MOSCOW = timezone(timedelta(hours=3))
 CACHE_SECONDS = 180
+DEPARTURES, ARRIVALS, SETTINGS = "Вылеты", "Прилёты", "Настройки"
+
+
+SOURCE = '<a href="https://rasp.yandex.ru/">Данные предоставлены сервисом Яндекс.Расписания</a>'
 
 
 class Flight(NamedTuple):
@@ -117,3 +125,58 @@ def preferences(user_id, airport=None, limit=None):
             saved_limit = saved_limit if limit is None else limit
             db.execute("REPLACE INTO settings VALUES (?, ?, ?)", (user_id, saved_airport, saved_limit))
         return saved_airport, saved_limit
+
+
+def normalize_number(number):
+    return re.sub(r"[\s-]", "", number.upper())
+
+
+def flight_line(flight):
+    time = flight.scheduled.strftime("%d.%m %H:%M")
+    terminal = f" · терминал {escape(flight.terminal)}" if flight.terminal else ""
+    return f"{time} · {escape(flight.number)} · {escape(flight.route)}{terminal}"
+
+
+async def show_board(update, event=None, number=None):
+    airport, limit = preferences(update.effective_user.id)
+    now = datetime.now(MOSCOW)
+    today = now.date()
+    airport_label = f"{AIRPORTS[airport]} ({airport})"
+    try:
+        if number is not None:
+            arrivals, departures = await asyncio.gather(
+                fetch_flights(airport, "arrival", today), fetch_flights(airport, "departure", today)
+            )
+            found = [flight for flight in arrivals + departures if normalize_number(flight.number) == number]
+            found.sort(key=lambda flight: flight.scheduled)
+            title = f"Поиск {number} на сегодня · {airport_label}"
+        else:
+            flights = await fetch_flights(airport, event, today)
+            found = [flight for flight in flights if flight.scheduled >= now]
+            if len(found) < limit:
+                found.extend(await fetch_flights(airport, event, today + timedelta(days=1)))
+            label = DEPARTURES if event == "departure" else ARRIVALS
+            title = f"{label} · {airport_label}"
+    except (httpx.HTTPError, ValueError) as error:
+        message = "Не удалось получить расписание. Попробуйте чуть позже."
+        if isinstance(error, httpx.HTTPStatusError):
+            if error.response.status_code in (401, 403):
+                message = "Яндекс отклонил ключ API. Проверьте RASP_KEY и перезапустите бота."
+            elif error.response.status_code == 429:
+                message = "Достигнут лимит запросов Яндекс Расписаний. Попробуйте позже."
+        await update.message.reply_text(message)
+        return
+
+    lines = [f"{title}\nВремя по расписанию, МСК"]
+    lines.extend(flight_line(flight) for flight in found[:limit])
+    if not found:
+        lines.append("В загруженном табло подходящих рейсов нет.")
+    lines.append(SOURCE)
+    await update.message.reply_text("\n\n".join(lines), parse_mode=ParseMode.HTML,
+                                    link_preview_options=LinkPreviewOptions(is_disabled=True))
+
+
+async def show_settings(update, **changes):
+    airport, limit = preferences(update.effective_user.id, **changes)
+    heading = "Настройки сохранены" if changes else SETTINGS
+    await update.message.reply_text(f"{heading}\nАэропорт: {AIRPORTS[airport]} ({airport})\nРейсов в выдаче: {limit}")
