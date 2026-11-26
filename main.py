@@ -1,18 +1,21 @@
 import asyncio
 import os
+import sqlite3
 from collections import defaultdict
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from time import monotonic
 from typing import NamedTuple
 import httpx
 
 
 API_URL = "https://api.rasp.yandex-net.ru/v3.0/schedule/"
-
-
+DATABASE = Path(__file__).with_name("flight_settings.sqlite3")
 AIRPORTS = {"SVO": "Шереметьево", "VKO": "Внуково", "DME": "Домодедово"}
 
 
+DEFAULT_AIRPORT, DEFAULT_LIMIT, MAX_LIMIT = "SVO", 5, 10
 MOSCOW = timezone(timedelta(hours=3))
 CACHE_SECONDS = 180
 
@@ -95,3 +98,22 @@ async def fetch_flights(airport, event, day):
         flights.sort(key=lambda flight: flight.scheduled)
         flight_cache[key] = monotonic(), flights
         return flights
+
+
+def preferences(user_id, airport=None, limit=None):
+    with closing(sqlite3.connect(DATABASE, timeout=1)) as db, db:
+        db.execute("""CREATE TABLE IF NOT EXISTS settings (
+            user_id INTEGER PRIMARY KEY, airport TEXT NOT NULL, flight_limit INTEGER NOT NULL)""")
+        if airport is not None or limit is not None:
+            db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT airport, flight_limit FROM settings WHERE user_id = ?", (user_id,)).fetchone()
+        saved_airport, saved_limit = row or (DEFAULT_AIRPORT, DEFAULT_LIMIT)
+        if saved_airport not in AIRPORTS:
+            saved_airport = DEFAULT_AIRPORT
+        if not isinstance(saved_limit, int) or not 1 <= saved_limit <= MAX_LIMIT:
+            raise sqlite3.DatabaseError("Некорректные настройки пользователя")
+        if airport is not None or limit is not None:
+            saved_airport = saved_airport if airport is None else airport
+            saved_limit = saved_limit if limit is None else limit
+            db.execute("REPLACE INTO settings VALUES (?, ?, ?)", (user_id, saved_airport, saved_limit))
+        return saved_airport, saved_limit
